@@ -1,138 +1,102 @@
-# WeCom ↔ OpenCode Long-Connection Bridge
+# WeCom ↔ OpenCode Bridge
 
 一个最小可用的桥接服务：
 
-- 使用 `botId + secret` 通过企业微信 AI 机器人 WebSocket 长连接收消息
-- 把消息转发给本地运行的 OpenCode
-- 复用 OpenCode session 保持上下文
-- 把最终文本结果回发到企业微信
+- 使用 `@wecom/aibot-node-sdk` 连接企业微信 AI 机器人长连接
+- 使用 `@opencode-ai/sdk` 连接已经启动的 `opencode serve`
+- 将企业微信会话映射为 OpenCode session
+- 收到文本消息后转发给 OpenCode，并把最终回复发回企业微信
 
 ## 当前实现范围
 
-- 文本消息收发
-- 私聊 / 群聊（群聊按 `chatId:senderId` 隔离 session，避免串上下文）
-- 占位回复 + 最终回复
-- 消息去重
-- 会话 TTL 清理
-- 每个会话串行处理，避免并发打乱上下文
+- 文本消息
+- 私聊 / 群聊（群聊按“群 + 用户”隔离上下文）
+- OpenCode 会话持久化映射到本地 JSON
+- 企业微信欢迎语（可选）
+- 最终回复模式（不是 SSE 流式透传 OpenCode 中间步骤）
 
-未实现：
+## 前置条件
 
-- 图片 / 文件 / 语音
-- 真正的 token 级流式转发
-- 持久化 session 映射
-- 多实例部署
+1. Node.js 20+
+2. 企业微信 AI 机器人 `botId` / `secret`
+3. 已安装并可运行 OpenCode
 
-## 1. 前置条件
+## 运行方式
 
-- Node.js 20+
-- 已创建企业微信 AI 机器人，并拿到：
-  - `botId`
-  - `secret`
-- 本机可启动 OpenCode server
-
-## 2. 启动 OpenCode
-
-先单独启动 OpenCode：
+### 1. 安装依赖
 
 ```bash
-opencode serve --port 4096
+npm install
 ```
 
-默认会连接到：
+### 2. 配置环境变量
 
-```text
-http://127.0.0.1:4096
-```
-
-## 3. 配置环境变量
-
-复制模板：
+复制示例文件：
 
 ```bash
 copy .env.example .env
 ```
 
-重点配置：
+然后填写：
 
 - `WECOM_BOT_ID`
 - `WECOM_BOT_SECRET`
-- `OPENCODE_DIRECTORY`
+- `OPENCODE_BASE_URL`（默认 `http://127.0.0.1:4096`）
 
-`OPENCODE_DIRECTORY` 要指向 **你希望 OpenCode 实际操作的项目目录**，不是这个 bridge 项目目录。
+### 3. 启动 OpenCode 服务
 
-示例：
+在你希望机器人操作的项目目录下启动：
 
-```env
-WECOM_BOT_ID=xxx
-WECOM_BOT_SECRET=yyy
-OPENCODE_BASE_URL=http://127.0.0.1:4096
-OPENCODE_DIRECTORY=D:/work/my-real-project
+```bash
+opencode serve
 ```
 
-可选：
+> 建议：在目标项目目录里执行 `opencode serve`，这样桥接过来的 session 会直接落在该项目上下文里。
 
-- `OPENCODE_MODEL=anthropic/claude-sonnet-4-20250514`
-- `OPENCODE_AGENT=build`
-- `OPENCODE_SYSTEM_PROMPT=...`
+### 4. 启动桥接服务
 
-## 4. 开发运行
+开发模式：
 
 ```bash
 npm run dev
 ```
 
-## 5. 构建与生产运行
+生产构建：
 
 ```bash
 npm run build
 npm start
 ```
 
-## 6. 会话映射规则
+## 环境变量
 
-- 单聊：`senderId -> OpenCode sessionId`
-- 群聊：`chatId:senderId -> OpenCode sessionId`
+| 变量 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `WECOM_BOT_ID` | 是 | - | 企业微信 AI 机器人 ID |
+| `WECOM_BOT_SECRET` | 是 | - | 企业微信 AI 机器人 Secret |
+| `OPENCODE_BASE_URL` | 否 | `http://127.0.0.1:4096` | OpenCode 服务地址 |
+| `OPENCODE_MODEL_PROVIDER` | 否 | - | 指定模型 provider |
+| `OPENCODE_MODEL_ID` | 否 | - | 指定模型 ID |
+| `WECOM_ALLOWED_USER_IDS` | 否 | 空 | 允许访问的企微用户 ID，逗号分隔 |
+| `WECOM_WELCOME_MESSAGE` | 否 | 示例欢迎语 | 用户进入单聊时发送的欢迎语 |
+| `SESSION_STORE_PATH` | 否 | `.data/sessions.json` | 会话映射持久化文件 |
 
-这样群里不同用户不会共用同一个 OpenCode 上下文。
+## 会话映射策略
 
-## 7. 关键行为
+- 私聊：`single:{userid}`
+- 群聊：`group:{chatid}:user:{userid}`
 
-### 占位回复
+群聊按“群 + 用户”隔离，是为了避免多人在同一群里共用一个 OpenCode 上下文。
 
-默认会先发一条：
+## 已知限制
 
-```text
-已收到，正在处理...
-```
+- 目前只处理文本消息
+- 目前发送的是“最终回复”，没有把 OpenCode 的思考 / 工具调用实时流式转发到企业微信
+- 需要你自己先启动 `opencode serve`
 
-然后再发最终结果。
+## 后续可扩展方向
 
-如果不需要，占位消息可设为空字符串：
-
-```env
-WECOM_PLACEHOLDER_MESSAGE=
-```
-
-### OpenCode session 丢失自动恢复
-
-如果 OpenCode 返回 session 不存在，bridge 会：
-
-1. 重新创建 session
-2. 自动重试当前消息一次
-
-## 8. 安全建议
-
-- `opencode serve` 只绑定本机地址
-- 不要把 `.env` 提交到仓库
-- 生产环境建议把 bridge 和 OpenCode 都放到受控主机上
-- 如果你不希望远程聊天直接触发高权限工具，请在 OpenCode 侧单独限制模型 / agent / tools
-
-## 9. 后续可扩展方向
-
-- 企微流式输出
-- `/new` 重置会话
-- `/session` 查看当前 session
-- 群聊 @ 机器人过滤
-- 图片 / 文件透传
-- 持久化 session 存储（SQLite / Redis）
+- 接入 OpenCode SSE 事件，实现更完整的流式回传
+- 支持图片 / 文件消息
+- 支持企微卡片和主动推送
+- 支持 `/new`、`/abort` 等命令式控制
