@@ -3,6 +3,20 @@ import { createOpencodeClient } from "@opencode-ai/sdk";
 import type { BridgeConfig } from "./config.js";
 import { SessionStore } from "./session-store.js";
 
+export interface PromptTextPartInput {
+  type: "text";
+  text: string;
+}
+
+export interface PromptFilePartInput {
+  type: "file";
+  mime: string;
+  url: string;
+  filename?: string;
+}
+
+export type PromptInputPart = PromptTextPartInput | PromptFilePartInput;
+
 interface TextPart {
   type: string;
   text?: string;
@@ -36,6 +50,8 @@ type PromptResponse = {
 type MessagesResponse = {
   data?: MessageWithParts[];
 } | MessageWithParts[];
+
+const OPENCODE_HEALTHCHECK_TIMEOUT_MS = 10000;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -97,12 +113,35 @@ function extractSessionId(response: SessionGetResponse | SessionCreateResponse):
   return response.data?.id ?? response.id;
 }
 
+function getSessionTitlePrefix(provider: BridgeConfig["botProvider"]): string {
+  return provider === "wecom" ? "WeCom" : "Feishu";
+}
+
+async function withHealthCheckTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`OpenCode health check timed out after ${OPENCODE_HEALTHCHECK_TIMEOUT_MS}ms.`));
+        }, OPENCODE_HEALTHCHECK_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 function truncateReply(text: string, maxLength = 4000): string {
   if (text.length <= maxLength) {
     return text;
   }
 
-  const suffix = "\n\n[已截断：回复超过企业微信展示长度限制]";
+  const suffix = "\n\n[已截断：回复超过机器人展示长度限制]";
   return `${text.slice(0, maxLength - suffix.length)}${suffix}`;
 }
 
@@ -120,10 +159,17 @@ export class OpencodeBridge {
   }
 
   public async healthCheck(): Promise<void> {
-    await this.client.path.get();
+    await withHealthCheckTimeout(this.client.path.get());
   }
 
-  public async promptConversation(conversationKey: string, text: string): Promise<string> {
+  public async promptConversation(
+    conversationKey: string,
+    parts: PromptInputPart[],
+  ): Promise<string> {
+    if (parts.length === 0) {
+      throw new Error("OpenCode prompt requires at least one part.");
+    }
+
     const sessionId = await this.getOrCreateSessionId(conversationKey);
     const promptResponse = (await this.client.session.prompt({
       path: { id: sessionId },
@@ -132,11 +178,11 @@ export class OpencodeBridge {
           ? {
               model: {
                 providerID: this.config.opencodeModelProvider,
-                modelID: this.config.opencodeModelId,
+              modelID: this.config.opencodeModelId,
               },
             }
           : {}),
-        parts: [{ type: "text", text }],
+        parts,
       },
     })) as PromptResponse;
 
@@ -168,7 +214,7 @@ export class OpencodeBridge {
 
     const created = (await this.client.session.create({
       body: {
-        title: `WeCom ${conversationKey}`,
+        title: `${getSessionTitlePrefix(this.config.botProvider)} ${conversationKey}`,
       },
     })) as SessionCreateResponse;
 

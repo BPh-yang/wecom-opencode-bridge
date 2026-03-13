@@ -1,7 +1,9 @@
 import AiBot, { generateReqId, type WsFrame } from "@wecom/aibot-node-sdk";
 
-import type { BridgeConfig } from "./config.js";
-import { OpencodeBridge } from "./opencode.js";
+import type { BotBridge } from "./bot-bridge.js";
+import type { WeComBridgeConfig } from "./config.js";
+import { ConversationQueue } from "./conversation-queue.js";
+import { OpencodeBridge, type PromptInputPart } from "./opencode.js";
 
 interface TextMessageBody {
   msgid: string;
@@ -21,54 +23,28 @@ interface EventMessageBody {
   };
 }
 
-class ConversationQueue {
-  private readonly chains = new Map<string, Promise<unknown>>();
-
-  public async run<T>(key: string, task: () => Promise<T>): Promise<T> {
-    const previous = this.chains.get(key) ?? Promise.resolve();
-    const current = (async () => {
-      await previous.then(
-        () => undefined,
-        () => undefined,
-      );
-      return task();
-    })();
-
-    this.chains.set(
-      key,
-      current.finally(() => {
-        if (this.chains.get(key) === current) {
-          this.chains.delete(key);
-        }
-      }),
-    );
-
-    return current;
-  }
-}
-
-export class WeComBridge {
+export class WeComBridge implements BotBridge {
   private readonly wsClient;
   private readonly queue = new ConversationQueue();
   private readonly recentMessageIds = new Set<string>();
   private readonly recentMessageOrder: string[] = [];
 
   public constructor(
-    private readonly config: BridgeConfig,
+    private readonly config: WeComBridgeConfig,
     private readonly opencodeBridge: OpencodeBridge,
   ) {
     this.wsClient = new AiBot.WSClient({
-      botId: config.wecomBotId,
-      secret: config.wecomBotSecret,
+      botId: config.wecom.botId,
+      secret: config.wecom.botSecret,
     });
   }
 
-  public start(): void {
+  public async start(): Promise<void> {
     this.registerEventHandlers();
     this.wsClient.connect();
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.wsClient.disconnect();
   }
 
@@ -97,11 +73,11 @@ export class WeComBridge {
       void this.handleTextMessage(frame);
     });
 
-    if (this.config.welcomeMessage) {
+    if (this.config.wecom.welcomeMessage) {
       this.wsClient.on("event.enter_chat", (frame: WsFrame<EventMessageBody>) => {
         void this.wsClient.replyWelcome(frame, {
           msgtype: "text",
-          text: { content: this.config.welcomeMessage ?? "" },
+          text: { content: this.config.wecom.welcomeMessage ?? "" },
         });
       });
     }
@@ -139,11 +115,12 @@ export class WeComBridge {
       await this.wsClient.replyStream(frame, streamId, "已收到，正在调用 OpenCode…", false);
 
       try {
-        const reply = await this.opencodeBridge.promptConversation(conversationKey, text);
+        const promptParts: PromptInputPart[] = [{ type: "text", text }];
+        const reply = await this.opencodeBridge.promptConversation(conversationKey, promptParts);
         await this.wsClient.replyStream(frame, streamId, reply, true);
       } catch (error) {
         const messageText = error instanceof Error ? error.message : "Unknown error";
-        console.error("[Bridge] Failed to process message:", error);
+        console.error("[WeCom] Failed to process message:", error);
         await this.wsClient.replyStream(
           frame,
           streamId,
@@ -164,7 +141,10 @@ export class WeComBridge {
   }
 
   private isAllowedUser(userId: string): boolean {
-    return this.config.allowedUserIds.size === 0 || this.config.allowedUserIds.has(userId);
+    return (
+      this.config.wecom.allowedUserIds.size === 0
+      || this.config.wecom.allowedUserIds.has(userId)
+    );
   }
 
   private isDuplicateMessage(messageId: string): boolean {
